@@ -4,24 +4,17 @@ import csv
 from datetime import datetime
 from maxusb_spmi import maxusb
 
-vchgin_levels = [5]
+vchgin_levels = [9, 15] # change this depending on wcin or vcin
 Battery_CV_Voltage = 4.2
 Battery_CC_Voltage = 2.7
 MAX_CHARGE_CURRENT = 0b110010 + 1 # max is 50/ 0x33
+MAX_CHARGE_VOLTAGE = 4.53
 CSV_HEADERS = ["timestamp", "CHGCC", "vbat", "ibat", "vchgin", "ichgin", "efficiency"]
 SPMI_SLAVE_ID = 0x03 #
 PATH=r'C:\Users\JRedhair\Documents\BC95_Efficiency'
 VCHGIN = "vchgin"
 WCIN = "wcin"
 
-"""
-TODO
-1. fill in all the functions to set the instruments by calling gpib API
-    - not sure which instrument connects to which part of the board
-2. fill in fast charge current function using spmi API
-
-
-"""
 
 # # Function to read register
 # def spmi_read_hex(sid, addr, length):
@@ -37,6 +30,8 @@ def set_chgcc(val: int):
     print("Setting CHGCC to", val)
     spmi_write(sid=SPMI_SLAVE_ID, addr=0x52, data=[val])
     
+
+
 def regulate_battsim_voltage(
     battsim: Instrument,
     agilent: Instrument,
@@ -147,7 +142,7 @@ def get_efficiency(vchgin: float, csv_writer, instruments: list[Instrument], tar
         time.sleep(0.5)
 
         keithley.configure(":OUTP ON")
-        time.sleep(2) # wait for current to settle
+        time.sleep(1) # wait for current to settle
 
         v_meas, battsim_setpoint, n, ok = regulate_battsim_voltage(
             battsim=battsim,
@@ -168,7 +163,67 @@ def get_efficiency(vchgin: float, csv_writer, instruments: list[Instrument], tar
 
         time.sleep(1) # Wait for settling
         read_all_data(csv_writer, instruments, i)
-        time.sleep(0.5)
+        time.sleep(0.05)
+
+    keithley.configure("OUTP OFF")
+
+def read_all_data_inc_vbatt(csv_writer, instruments: list[Instrument]):
+    agilent, fluke, keithley, *_ = instruments
+    vbat, ibat, vchgin, ichgin = read_agilent(agilent), read_fluke(fluke), read_keithley(keithley, "voltage"), read_keithley(keithley, "current")
+    efficiency = (vbat * ibat) / (vchgin * ichgin)
+    row = {
+        "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "vbat": vbat,
+        "ibat": ibat,
+        "vchgin": vchgin,
+        "ichgin": ichgin,
+        "efficiency": efficiency
+    }
+    print(row)
+    csv_writer.writerow(row)
+
+# for every vchgin, increment charging voltage modes and get readings
+def get_efficiency_inc_vbat(csv_writer, instruments: list[Instrument]):
+    agilent, fluke, keithley, battsim = instruments
+    """
+    2461 off
+    sleep 0.5s
+    write vbatt/ regulate
+    sleep 5s
+    2461 on
+    measure
+    """
+
+    # Track the last setpoint commanded to battsim
+    vbatt = 2.7
+    while vbatt <= 4.5:
+        print(vbatt)
+        set_battsim(battsim=battsim, voltage=vbatt)
+
+        v_meas, battsim_setpoint, n, ok = regulate_battsim_voltage(
+            battsim=battsim,
+            agilent=agilent,
+            target_v=vbatt,
+            current_setpoint=vbatt,
+            tol=0.005,
+            kp=0.6,
+            max_step=0.05,
+            settle_s=0.2,
+            max_iters=50,
+            min_setpoint=0.0,
+            max_setpoint=5.5,
+            verbose=False,
+        )
+
+
+        time.sleep(0.5) # Wait for settling
+        read_all_data_inc_vbatt(csv_writer, instruments)
+        vbatt += 0.05
+
+    set_battsim(battsim=battsim, voltage=MAX_CHARGE_VOLTAGE)
+    read_all_data_inc_vbatt(csv_writer, instruments)
+
+    
 
     keithley.configure("OUTP OFF")
     
@@ -177,37 +232,46 @@ def get_efficiency(vchgin: float, csv_writer, instruments: list[Instrument], tar
 # Voltage test sequence
 # Stepping through 5V, 9V, and 12V
 # ----------------------------
-def run_tests(instruments: list[Instrument]=[]):
+def run_tests(instruments: list[Instrument]=[], test_mode:str = ""):
+    if test_mode == "vbatt":
+        CSV_HEADERS.remove("CHGCC")
     for level in vchgin_levels:
         set_keithley(instruments[2], level) # set the vchgin level
-        filename = fr"{PATH}\A.32_{datetime.now().strftime(f'%Y%m%d_%H_%M_%S-{level}V')}.csv" # create the csv
+        filename = fr"{PATH}\A.32_{datetime.now().strftime(f'%Y%m%d_%H_%M_%S-{level}V_{test_mode}')}.csv" # create the csv
+
         with open(filename, "w", newline="") as f:
+            
             writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
             writer.writeheader()
-            get_efficiency(level, writer, instruments)
+            if test_mode == "chgcc":
+                get_efficiency(level, writer, instruments)
+            elif test_mode == "vbatt":
+                get_efficiency_inc_vbat(writer, instruments)
+            else:
+                print("not a valid test\n\n")
+    print("Exiting Test\n")
 
-def setup_max77795(chgin: str = "vcin"):
+
+def setup_max77795(chgin: str = "vcin", test_mode: str = ""):
     # ----------------------------
-# SPMI setup for CHGIN
-# 0x3 is SPMI SID for Charger portion of BC95
-# ----------------------------
+    # SPMI setup for CHGIN
+    # 0x3 is SPMI SID for Charger portion of BC95
+    # ----------------------------
     spmi_write(0x3, 0x56, [0x0C])  # Unlock charger in cfg_6
-    spmi_write(0x3, 0x52, [0x33])  # Fast Charging Current = 2.5A cfg_2
     spmi_write(0x3, 0x54, [0x37])  # Termination Voltage = 4530mV cfg_4
     spmi_write(0x3, 0x59, [0xFF])  # Charge Current limit for CHGIN cfg_9
     spmi_write(0x3, 0x5A, [0x7F])  # Charge Current limit for WCIN cfg_10
     spmi_write(0x3, 0x50, [0x05])  # Charge mode = 0x5
+    if test_mode == "":
+        print("no test mode\nreturn\n\n")
+        return
+    if test_mode == "vbatt":
+        spmi_write(0x3, 0x52, [0x33])  # Fast Charging Current = 2.5A cfg_2
 
-    # spmi_read_hex(0x3, 0x56, 1) # Reads config 6
     if chgin == "wcin":
         spmi_write(0x3, 0x67, [0x4E]) # enable inlim cont & dynamic floor cfg_23
 
 def test_keithley(keithley: Instrument):
-    
-    # keithley.configure("*RST;*CLS")
-    # keithley.configure(":SOUR:FUNC VOLT")
-    # keithley.configure(":SYST:RSEN ON")      # <-- remote sense (4-wire)
-    # keithley.configure(":OUTP ON")
 
     v = read_keithley(keithley, "voltage")
     i = read_keithley(keithley, "current")
@@ -215,18 +279,48 @@ def test_keithley(keithley: Instrument):
     print()
 
 def main():
+    
+    INPUT_MODES = {
+        "1": "vcin",
+        "2": "wcin",
+    }
+
+    TEST_MODES = {
+        "1": "chgcc",
+        "2": "vbatt",
+    }
+
+    input_choice = input(
+        "Select an efficiency input:\n"
+        "  [1] VCIN\n"
+        "  [2] WCIN\n"
+        "> "
+    ).strip()
+
+    test_choice = input(
+        "Select a test mode:\n"
+        "  [1] Vary fast charge current\n"
+        "  [2] Vary charging voltage\n"
+        "> "
+    ).strip()
+    input_mode = INPUT_MODES.get(input_choice, "unknown")
+    test_mode = TEST_MODES.get(test_choice, "unknown")
+
+    print(f"\nTesting input={input_mode} with test=increment {test_mode}\n")
+
     instruments = setup_instruments()
     setup_max77795(VCHGIN)
     agilent, fluke, keithley, battsim = instruments
+    print(instruments)
+    run_tests(instruments=instruments, test_mode=test_mode)
     # test_keithley(keithley=keithley)
 
-    print(instruments)
-    run_tests(instruments=instruments)
+    # run_v_tests(instruments=instruments)
     # ----------------------------
     # Cleanup to close GPIB comms
     # ----------------------------
-    for instrument in instruments:
-        instrument.close()
+    # for instrument in instruments:
+    #     instrument.close()
 
 if __name__ == "__main__":
     main()
