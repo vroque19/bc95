@@ -1,120 +1,150 @@
 import pyvisa
 import numpy as np
-import time
-import csv
 
-KEITHLEY_2306 = 'GPIB0::6::INSTR' # Battery simulator
-AGILENT_34401A = 'GPIB0::21::INSTR' # measure battery voltage
-KEITHLEY_2461 = 'GPIB0::18::INSTR' # sourcemeter handles chgin
-FLUKE_8845A = 'GPIB0::24::INSTR' # battery current
+KEITHLEY_2306 = 'GPIB0::16::INSTR'    # Battery simulator
+FLUKE_8845A = 'GPIB0::24::INSTR'     # Battery voltage DMM
+
 
 class Instrument:
     def __init__(self, resource_manager, addr: str):
         self.device = resource_manager.open_resource(addr)
         self.addr = addr
 
-    def configure(self, command):
-        """Send configuration strings."""
+    def configure(self, command: str) -> None:
+        """Send a SCPI command (write)."""
         self.device.write(command)
-    
-    def read_avg(self, query_cmd: str, samples=3, split_index=None):
-        """Generic averaging function for any meter."""
-        readings = []
+
+    def query(self, command: str) -> str:
+        """Send a SCPI query and return the raw response."""
+        return self.device.query(command)
+
+    def read_avg(
+        self,
+        query_cmd: str,
+        samples: int = 3,
+        parse: str = 'float',
+        round_digits: int | None = None,
+    ) -> float:
+        """Generic N-sample average reader.
+
+        Parameters
+        ----------
+        query_cmd:
+            SCPI query to execute each sample.
+        samples:
+            Number of samples to average.
+        parse:
+            'float'    -> response is a single float
+            'keithley' -> response is semicolon-delimited; first token is the value
+        round_digits:
+            If provided, rounds each sample before averaging.
+        """
+        readings: list[float] = []
+
         for _ in range(samples):
-            raw = self.device.query(query_cmd)
-            # If the response is a CSV string (like Keithley), split it
-            if split_index is not None:
-                # raw might look like: "5.000192E+00;5.000192E+00\n"
-                clean = raw.strip()              # remove newline
-                parts = clean.split(";")         # split into separate numbers
-                first = float(parts[0])          # convert the first one
-                val = round(first, 4)            # round to 4 decimal places
-                # val = float(raw.split(',')[split_index])
+            raw = self.query(query_cmd)
+
+            if parse == 'keithley':
+                # Example: "5.000192E+00;5.000192E+00" -> take first token
+                val = float(raw.strip().split(';')[0])
             else:
                 val = float(raw)
-            readings.append(val)
-        return np.mean(readings)
-    
 
-    def close(self):
+            if round_digits is not None:
+                val = round(val, round_digits)
+
+            readings.append(val)
+
+        return float(np.mean(readings))
+
+    def close(self) -> None:
         self.device.close()
 
 
-
-def setup_instruments():
+def setup_instruments()-> list:
+    """Open all instruments and put them in a known configuration."""
     rm = pyvisa.ResourceManager()
 
     battsim = Instrument(rm, KEITHLEY_2306)
-    voltmeter = Instrument(rm, AGILENT_34401A)
-    currentmeter = Instrument(rm, FLUKE_8845A)
-    sourcemeter = Instrument(rm, KEITHLEY_2461)
+    dmm = Instrument(rm, FLUKE_8845A)
 
-    voltmeter.configure("*RST; :CONF:VOLT:DC")
-    currentmeter.configure("*RST; :CONF:CURR:DC 10") # set current range to 10A
-    sourcemeter.configure(":OUTP OFF; :SOUR:FUNC VOLT; :SYST:RSEN ON; :OUTP ON")
+    dmm.configure('*RST; :CONF:CURR:DC 10')  # 10A range
 
-    return voltmeter, currentmeter, sourcemeter, battsim # agilent, fluke, keithley
+    # 2461: known-good state for 4-wire sense + voltage source; keep output OFF by default
 
-def read_agilent(voltmeter: Instrument):
-    avg_volt = voltmeter.read_avg(query_cmd="READ?", samples=3)
-    return avg_volt
-    
-def read_fluke(currentmeter: Instrument):
-    avg_current = currentmeter.read_avg(query_cmd="READ?", samples=3)
-    return avg_current
+    return [dmm, battsim]
 
-def read_keithley(sourcemeter: Instrument, mode: str):
-    """
-    Reads voltage, current, or resistance from Keithley 2461 SourceMeter and returns the average.
-    """
-    # Map the mode string to the corresponding index in the Keithley output
-    # Indices - 0: Voltage, 1: Current, 2: Resistance
+
+def read_agilent(voltmeter: Instrument, digits: int = 6, samples: int = 3) -> float:
+    return round(voltmeter.read_avg('READ?', samples=samples, parse='float'), digits)
+
+
+def read_fluke(currentmeter: Instrument, digits: int = 6, samples: int = 3) -> float:
+    return round(currentmeter.read_avg('READ?', samples=samples, parse='float'), digits)
+
+def read_keithley_2306(battsim: Instrument, digits: int = 6, samples: int = 3) -> float:
+    return round(battsim.read_avg("MEAS:CURR?", samples, "float"), digits)
+
+def set_keithley_2306(battsim: Instrument, voltage: float, output_on: bool = True) -> None:
+    """Set 2306 battery simulator voltage and (optionally) enable output."""
+    battsim.configure(f'SOUR:VOLT {voltage}')
+    if output_on:
+        battsim.configure('OUTP ON')
+
+
+def read_keithley(sourcemeter: Instrument, mode: str, digits: int = 6, samples: int = 3) -> float:
+    """Read voltage or current from the 2461 and return an N-sample average."""
     mode_map = {
-        "voltage": ":SENS:FUNC \"VOLT\"; :MEAS:VOLT?; :FETCh?",
-        "current": ":SENS:FUNC \"CURR\"; :MEAS:CURR?; :FETCh?"
+        'voltage': ':SENS:FUNC "VOLT"; :MEAS:VOLT?; :FETCh?',
+        'current': ':SENS:FUNC "CURR"; :MEAS:CURR?; :FETCh?',
     }
 
-    query = mode_map.get(mode.lower())
-    print(mode, query)
-    s = sourcemeter.read_avg(query_cmd=query, split_index=1)
-    # floats = [float(x) for x in s.strip().split(';')]
-    return s
+    query_cmd = mode_map.get(mode.lower())
+    if query_cmd is None:
+        raise ValueError("mode must be 'voltage' or 'current'")
 
-def set_keithley(sourcemeter: Instrument, voltage: float):
-    """
-    Configures and turns on the Keithley 2461 SourceMeter to output voltage.
-    """
-    sourcemeter.configure(f":SOUR:FUNC VOLT; :SOUR:VOLT {voltage}; :OUTPut:STATe ON")
-    return f"SourceMeter ON: {voltage}V"
+    val = sourcemeter.read_avg(query_cmd, samples=samples, parse='keithley')
+    return round(val, digits)
 
-def set_battsim(battsim: Instrument, voltage: float):
-    """
-    Sets Keithley 2306 Battery Simulator to output voltage.
-    """
-    battsim.configure(f"SOUR:VOLT {voltage}")
-    return
 
-# test gpib code
-def scan_gpib():
+def set_keithley(sourcemeter: Instrument, voltage: float, output_on: bool = True) -> None:
+    """Set 2461 to source a voltage and (optionally) enable output."""
+    state = 'ON' if output_on else 'OFF'
+    sourcemeter.configure(f':SOUR:FUNC VOLT; :SOUR:VOLT {voltage}; :OUTP {state}')
+
+
+def set_battsim(battsim: Instrument, voltage: float, output_on: bool = True) -> None:
+    """Set 2306 battery simulator voltage and (optionally) enable output.
+
+    NOTE: If your 2306 uses a different command than 'OUTP ON', change it here.
+    """
+    battsim.configure(f'SOUR:VOLT {voltage}')
+    if output_on:
+        battsim.configure('OUTP ON')
+
+
+def scan_gpib() -> None:
     rm = pyvisa.ResourceManager()
-    instruments = rm.list_resources()
-    print("Connected instruments:", instruments)
+    resources = rm.list_resources()
+    print('Connected instruments:', resources)
 
-    gpib_instruments = [i for i in instruments if "GPIB" in i]
+    gpib_resources = [r for r in resources if 'GPIB' in r]
+    if not gpib_resources:
+        print('No GPIB instruments found.')
+        return
 
-    if not gpib_instruments:
-        print("No GPIB instruments found.")
-    else:
-        for address in gpib_instruments:
-            print(f"Connecting to {address}...")
+    for address in gpib_resources:
+        print(f'Connecting to {address}...')
+        instrument = None
+        try:
+            instrument = rm.open_resource(address)
+            idn = instrument.query('*IDN?')
+            print(f'Instrument at {address} responded with ID: {idn}')
+        except Exception as e:
+            print(f'Failed to communicate with {address}: {e}')
+        finally:
             try:
-                instrument = rm.open_resource(address)
-                idn = instrument.query("*IDN?")
-                print(f"Instrument at {address} responded with ID: {idn}")
-            except Exception as e:
-                print(f"Failed to communicate with {address}: {e}")
-            finally:
-                try:
+                if instrument is not None:
                     instrument.close()
-                except:
-                    pass
+            except Exception:
+                pass
