@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 .png
+=======
+*.png
+>>>>>>> c8cadc9 (add gitignore)
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
